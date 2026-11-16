@@ -96,7 +96,7 @@ def handle(msg):
     with db() as c:
         old = c.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
         if old:
-            c.execute("UPDATE users SET username=?,name=? WHERE id=?", (username or None, name, uid))
+            c.execute("UPDATE users SET username=?,name=?,role=CASE WHEN ? THEN 'admin' ELSE role END WHERE id=?", (username or None, name, username in ADMINS, uid))
         else:
             c.execute("INSERT INTO users(id,username,name,role,created) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
                       (uid, username or None, name, "admin" if username in ADMINS else "member", now()))
