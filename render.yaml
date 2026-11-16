@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ponz-bale-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BALE_BOT_TOKEN
+        sync: false
+      - key: BOOTSTRAP_ADMIN_USERNAMES
+        value: me_god_me,alireza_xri,taha1291mani,kian_sa
+      - key: TIMEZONE
+        value: Asia/Tehran
