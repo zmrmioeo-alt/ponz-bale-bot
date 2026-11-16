@@ -8,6 +8,8 @@ services:
     envVars:
       - key: BALE_BOT_TOKEN
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: BOOTSTRAP_ADMIN_USERNAMES
         value: me_god_me,alireza_xri,taha1291mani,kian_sa
       - key: TIMEZONE
