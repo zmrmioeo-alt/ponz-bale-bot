@@ -1,12 +1,15 @@
-import os, time, sqlite3, threading, logging
+import os, time, threading, logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+import psycopg
+from psycopg.rows import dict_row
 import requests
 from flask import Flask, jsonify
 
 TOKEN = os.getenv("BALE_BOT_TOKEN", "").strip()
 API = "https://tapi.bale.ai/bot" + TOKEN
-DB = os.getenv("DB_PATH", "ponz.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran"))
 ADMINS = {x.strip().lower().lstrip("@") for x in os.getenv("BOOTSTRAP_ADMIN_USERNAMES", "me_god_me,alireza_xri,taha1291mani,kian_sa").split(",") if x.strip()}
 app = Flask(__name__)
@@ -14,22 +17,35 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ponz")
 MENU = [["📋 ثبت حضور و غیاب", "⚠️ ثبت انضباطی"], ["👥 فهرست اعضا", "➕ افزودن عضو"], ["📊 گزارش امروز", "👤 وضعیت من"], ["📚 سوابق انضباطی", "🧑‍💼 مدیریت مسئولان"]]
 
+class DB:
+    def __init__(self):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not configured")
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15)
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
+        finally:
+            self.conn.close()
+    def execute(self, query, params=()):
+        return self.conn.execute(query.replace("?", "%s"), params)
+    def commit(self):
+        self.conn.commit()
+
 def db():
-    c = sqlite3.connect(DB, timeout=20)
-    c.row_factory = sqlite3.Row
-    return c
+    return DB()
 
 def now():
     return datetime.now(TZ).isoformat(timespec="seconds")
 
 def init():
     with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, name TEXT, role TEXT DEFAULT 'member', active INTEGER DEFAULT 1, created TEXT);
-        CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, note TEXT, registrar INTEGER, created TEXT);
-        CREATE TABLE IF NOT EXISTS discipline(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, details TEXT, registrar INTEGER, created TEXT);
-        CREATE TABLE IF NOT EXISTS sessions(user_id INTEGER PRIMARY KEY, state TEXT, data TEXT DEFAULT '');
-        """)
+        c.execute("SELECT 1")
 
 def api(method, payload=None, get=False):
     if not TOKEN:
@@ -50,7 +66,7 @@ def send(uid, message, keyboard=None):
 
 def role(uid):
     with db() as c:
-        row = c.execute("SELECT role FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+        row = c.execute("SELECT role FROM users WHERE id=? AND active=true", (uid,)).fetchone()
     return row["role"] if row else None
 
 def session(uid, state=None, data=""):
@@ -58,8 +74,8 @@ def session(uid, state=None, data=""):
         if state is None:
             c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
         else:
-            c.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?)", (uid, state, data))
-        c.commit()
+            c.execute("""INSERT INTO sessions(user_id,state,data) VALUES(?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET state=EXCLUDED.state,data=EXCLUDED.data""", (uid, state, data))
 
 def get_session(uid):
     with db() as c:
@@ -67,13 +83,14 @@ def get_session(uid):
 
 def members():
     with db() as c:
-        return c.execute("SELECT id,name FROM users WHERE active=1 ORDER BY name").fetchall()
+        return c.execute("SELECT id,name FROM users WHERE active=true ORDER BY name").fetchall()
 
 def handle(msg):
     sender = msg.get("from") or {}
     uid = sender.get("id")
     if not uid:
         return
+    uid = int(uid)
     username = (sender.get("username") or "").lower().lstrip("@")
     name = " ".join(x for x in [sender.get("first_name"), sender.get("last_name")] if x) or username or str(uid)
     with db() as c:
@@ -81,8 +98,8 @@ def handle(msg):
         if old:
             c.execute("UPDATE users SET username=?,name=? WHERE id=?", (username, name, uid))
         else:
-            c.execute("INSERT INTO users(id,username,name,role,created) VALUES(?,?,?,?,?)", (uid, username, name, "admin" if username in ADMINS else "member", now()))
-        c.commit()
+            c.execute("INSERT INTO users(id,username,name,role,created) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                      (uid, username or None, name, "admin" if username in ADMINS else "member", now()))
     current_role = role(uid)
     chat_id = (msg.get("chat") or {}).get("id", uid)
     text = (msg.get("text") or "").strip()
@@ -98,12 +115,12 @@ def handle(msg):
         return
     if text == "👤 وضعیت من":
         with db() as c:
-            rows = c.execute("SELECT status,note,created FROM attendance WHERE user_id=? ORDER BY id DESC LIMIT 15", (uid,)).fetchall()
+            rows = c.execute("SELECT status,note,created::text AS created FROM attendance WHERE user_id=? ORDER BY id DESC LIMIT 15", (uid,)).fetchall()
         send(uid, "سوابق حضور:\n" + ("\n".join(f"{x['created'][:16]} | {x['status']} | {x['note'] or ''}" for x in rows) if rows else "موردی ثبت نشده."))
         return
     if text == "📚 سوابق انضباطی":
         with db() as c:
-            rows = c.execute("SELECT title,details,created FROM discipline WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall()
+            rows = c.execute("SELECT title,details,created::text AS created FROM discipline WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall()
         send(uid, "سوابق انضباطی:\n" + ("\n".join(f"{x['created'][:16]} | {x['title']}: {x['details']}" for x in rows) if rows else "موردی ثبت نشده."))
         return
     if current_role not in ("admin", "registrar"):
@@ -123,10 +140,9 @@ def handle(msg):
         send(uid, "شماره عضو را بفرستید:\n" + "\n".join(f"{i+1}. {x['name']}" for i, x in enumerate(rows)))
         return
     if text == "📊 گزارش امروز":
-        day = datetime.now(TZ).date().isoformat()
         with db() as c:
-            counts = c.execute("SELECT status,COUNT(*) n FROM attendance WHERE substr(created,1,10)=? GROUP BY status", (day,)).fetchall()
-            discipline_count = c.execute("SELECT COUNT(*) n FROM discipline WHERE substr(created,1,10)=?", (day,)).fetchone()["n"]
+            counts = c.execute("SELECT status,COUNT(*) AS n FROM attendance WHERE created::date=?::date GROUP BY status", (datetime.now(TZ).date().isoformat(),)).fetchall()
+            discipline_count = c.execute("SELECT COUNT(*) AS n FROM discipline WHERE created::date=?::date", (datetime.now(TZ).date().isoformat(),)).fetchone()["n"]
         send(uid, "گزارش امروز:\n" + ("\n".join(f"{x['status']}: {x['n']}" for x in counts) if counts else "بدون ثبت حضور") + f"\nموارد انضباطی: {discipline_count}")
         return
     if text == "🧑‍💼 مدیریت مسئولان" and current_role == "admin":
@@ -148,8 +164,7 @@ def handle(msg):
             send(uid, "شناسه باید عددی باشد.")
             return
         with db() as c:
-            c.execute("INSERT OR IGNORE INTO users(id,name,role,created) VALUES(?,?,?,?)", (target, data, "member", now()))
-            c.commit()
+            c.execute("INSERT INTO users(id,name,role,created) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING", (target, data, "member", now()))
         session(uid)
         send(uid, "عضو ثبت شد.", MENU)
     elif state in ("attendance_member", "discipline_member"):
@@ -174,7 +189,6 @@ def handle(msg):
         target, status = data.split("|", 1)
         with db() as c:
             c.execute("INSERT INTO attendance(user_id,status,note,registrar,created) VALUES(?,?,?,?,?)", (int(target), status, "" if text == "-" else text, uid, now()))
-            c.commit()
         session(uid)
         send(uid, "حضور و غیاب ثبت شد.", MENU)
     elif state == "discipline_title":
@@ -184,7 +198,6 @@ def handle(msg):
         target, title = data.split("|", 1)
         with db() as c:
             c.execute("INSERT INTO discipline(user_id,title,details,registrar,created) VALUES(?,?,?,?,?)", (int(target), title, text, uid, now()))
-            c.commit()
         session(uid)
         send(uid, "مورد انضباطی ثبت شد.", MENU)
     elif state == "promote" and current_role == "admin":
@@ -195,7 +208,6 @@ def handle(msg):
             return
         with db() as c:
             c.execute("UPDATE users SET role='registrar' WHERE id=?", (target,))
-            c.commit()
         session(uid)
         send(uid, "در صورت وجود حساب، نقش مسئول ثبت اعمال شد.", MENU)
     else:
@@ -204,7 +216,13 @@ def handle(msg):
 
 @app.get("/")
 def health():
-    return jsonify(service="Ponz Bale Bot", status="running")
+    try:
+        with db() as c:
+            c.execute("SELECT 1")
+        return jsonify(service="Ponz Bale Bot", status="running", database="connected")
+    except Exception:
+        log.exception("database health check failed")
+        return jsonify(service="Ponz Bale Bot", status="degraded", database="disconnected"), 503
 
 def polling():
     offset = None
